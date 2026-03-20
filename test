@@ -1,0 +1,880 @@
+"""
+Bank Branch Opportunity Scoring  —  PLIK FINALNY
+=================================================
+
+Dwa moduły w jednym pliku:
+  1. run_scoring()      — pipeline analityczny → pd.DataFrame
+  2. export_dashboard() — eksport do .xlsx z dynamicznymi wagami
+
+UŻYCIE
+------
+    import pandas as pd
+    from scoring import run_scoring, export_dashboard
+
+    siec  = pd.read_excel("Struktura_sieci.xlsx", dtype={"teryt_gmina": str})
+    gminy = pd.read_csv("Dane_o_gminach.csv",
+                        dtype={"teryt_gmina": str, "teryt_powiat": str})
+
+    result = run_scoring(siec, gminy)
+    export_dashboard(result, "scoring_dashboard.xlsx")
+
+WAGI W EXCELU
+-------------
+    Arkusz Dashboard, komórki B5:B8 (żółte) — edytowalne bez Pythona.
+    Arkusz Ranking zawiera kolumnę „Score (Excel)" wyliczaną formułą:
+        =SUMA(waga_penetracja * c_penetracja + ...) / SUMA(wag)
+    Zmiana wagi w B5:B8 natychmiast przelicza score i ranking dla wszystkich gmin.
+
+DANE WEJŚCIOWE
+--------------
+    Struktura_sieci (xlsx):
+        gmina, teryt_gmina, powiat
+        (każdy wiersz = jedna miejscowość z oddziałem banku)
+
+    Dane_o_gminach (csv):
+        teryt_gmina, teryt_powiat, gmina, powiat
+        Liczba mieszkańców
+        udział klientów w mieszkańcach (%)
+        mediana wynagrodzenia brutto
+        przyrost naturalny na 1 tys mieszkańców
+        saldo migracji na 1 tys. mieszkańców
+        różnica między liczbą mieszkańców w wieku 20-35 wg powiatu
+        Liczba placówek własnych (moje)
+        Liczba placówek własnych konkurencji
+
+LOGIKA BLENDINGU
+----------------
+    gmina == powiat (miasto na prawach powiatu) → 100 % danych gminnych
+    gmina jest częścią powiatu                  → 60 % gmina + 40 % śr. ważona powiatu
+    Kolumna różnicy wiekowej (20-35) jest na poziomie powiatu — nie blendowana.
+
+SKŁADOWE SCORINGU  (każda znormalizowana min-max → [0, 1])
+----------------------------------------------------------
+    penetracja_gap      (domyślna waga 0.35)
+        MAX_PENETRATION − aktualny udział klientów
+    luka_konkurencyjna  (domyślna waga 0.25)
+        1 − własne / (własne + konkurencja)
+    dynamika_wzrostu    (domyślna waga 0.25)
+        0.6 × saldo_migracji + 0.4 × przyrost_naturalny
+    shift_demograficzny (domyślna waga 0.15)
+        delta grupy 20-35 wg powiatu (min-max)
+"""
+
+import numpy as np
+import pandas as pd
+import warnings
+from openpyxl import Workbook
+from openpyxl.chart import BarChart, ScatterChart, Reference, Series
+from openpyxl.chart.label import DataLabelList
+from openpyxl.formatting.rule import ColorScaleRule
+from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
+from openpyxl.utils import get_column_letter
+
+warnings.filterwarnings("ignore")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# KONFIGURACJA  —  jedyne miejsce wymagające edycji przy zmianie nazw kolumn
+# ══════════════════════════════════════════════════════════════════════════════
+
+# Dokładne nazwy kolumn w Dane_o_gminach
+COL_TERYT_GMINA  = "teryt_gmina"
+COL_TERYT_POWIAT = "teryt_powiat"
+COL_GMINA        = "gmina"
+COL_POWIAT       = "powiat"
+
+COL_LUDNOSC      = "Liczba mieszkańców"
+COL_UDZIAL       = "udział klientów w mieszkańcach (%)"
+COL_MEDIANA      = "mediana wynagrodzenia brutto"
+COL_PRZYROST     = "przyrost naturalny na 1 tys mieszkańców"
+COL_MIGRACJA     = "saldo migracji na 1 tys. mieszkańców"
+COL_DELTA_2035   = "różnica między liczbą mieszkańców w wieku 20-35 wg powiatu"
+COL_OWN          = "Liczba placówek własnych (moje)"
+COL_COMP         = "Liczba placówek własnych konkurencji"
+
+# Parametry modelu
+BLEND_GMINA     = 0.60
+BLEND_POWIAT    = 0.40
+MAX_PENETRATION = 0.35
+
+# Domyślne wagi składowych (suma = 1.0)
+DEFAULT_WEIGHTS = {
+    "penetracja_gap":      0.35,
+    "luka_konkurencyjna":  0.25,
+    "dynamika_wzrostu":    0.25,
+    "shift_demograficzny": 0.15,
+}
+
+# Kolumny blendowane (ważona średnia przez ludność na poziomie powiatu)
+_BLEND_COLS = [COL_UDZIAL, COL_MEDIANA, COL_PRZYROST, COL_MIGRACJA]
+# Kolumny sumowane na poziomie powiatu
+_SUM_COLS   = [COL_LUDNOSC, COL_OWN, COL_COMP]
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# MODUŁ 1 — PIPELINE SCORINGOWY
+# ══════════════════════════════════════════════════════════════════════════════
+
+def run_scoring(
+    miejscowosci_df: pd.DataFrame,
+    dane_gminy_df: pd.DataFrame,
+    weights: dict | None = None,
+) -> pd.DataFrame:
+    """
+    Uruchamia pełny pipeline i zwraca jeden DataFrame z wynikami.
+
+    Returns
+    -------
+    pd.DataFrame posortowany malejąco według opportunity_score.
+    Kolumny: id + b_* (dane po blendingu) + c_* (składowe 0-1) + score/segment/rank.
+    """
+    w = weights if weights is not None else DEFAULT_WEIGHTS.copy()
+    _validate_weights(w)
+
+    siec    = _prepare_network(miejscowosci_df)
+    gminy   = _prepare_demographics(dane_gminy_df)
+    gminy   = _detect_city_county(gminy)
+    pow_agg = _aggregate_powiat(gminy)
+    blended = _blend(gminy, pow_agg)
+
+    siec_slim = siec[[COL_TERYT_GMINA, "n_placowek_wlasnych"]]
+    result    = blended.merge(siec_slim, on=COL_TERYT_GMINA, how="inner")
+
+    result = _compute_score_components(result)
+    result = _compute_composite_score(result, w)
+
+    return result[_build_col_order(result)]\
+        .sort_values("opportunity_score", ascending=False)\
+        .reset_index(drop=True)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Etap 1 — sieć oddziałów
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _prepare_network(df: pd.DataFrame) -> pd.DataFrame:
+    d = df.copy()
+    d.columns = d.columns.str.strip()
+    d = d.rename(columns={
+        _find_col(d, ["teryt_gmina", "Teryt_gmina"]): COL_TERYT_GMINA,
+        _find_col(d, ["gmina",       "Gmina"]):        COL_GMINA,
+        _find_col(d, ["powiat",      "Powiat"]):       COL_POWIAT,
+    })
+    return (
+        d.groupby([COL_TERYT_GMINA, COL_GMINA, COL_POWIAT], as_index=False)
+         .size()
+         .rename(columns={"size": "n_placowek_wlasnych"})
+    )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Etap 2 — normalizacja danych demograficznych
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _prepare_demographics(df: pd.DataFrame) -> pd.DataFrame:
+    d = df.copy()
+    d.columns = d.columns.str.strip()
+    if COL_UDZIAL in d.columns and d[COL_UDZIAL].max() > 1:
+        d[COL_UDZIAL] = d[COL_UDZIAL] / 100
+    return d
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Etap 3 — identyfikacja miast na prawach powiatu
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _detect_city_county(df: pd.DataFrame) -> pd.DataFrame:
+    d = df.copy()
+    name_match = (
+        d[COL_GMINA].str.lower().str.strip() ==
+        d[COL_POWIAT].str.lower().str.strip()
+    )
+    powiat_cnt  = d.groupby(COL_TERYT_POWIAT)[COL_TERYT_GMINA].transform("count")
+    teryt_match = (
+        (d[COL_TERYT_GMINA].str[:4] == d[COL_TERYT_POWIAT].str[:4]) &
+        (powiat_cnt == 1)
+    )
+    d["gmina_jest_powiatem"] = name_match | teryt_match
+    return d
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Etap 4 — agregacja na poziom powiatu
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _aggregate_powiat(df: pd.DataFrame) -> pd.DataFrame:
+    records = []
+    for powiat_id, grp in df.groupby(COL_TERYT_POWIAT):
+        rec = {COL_TERYT_POWIAT: powiat_id}
+        pop = grp[COL_LUDNOSC].fillna(0) if COL_LUDNOSC in grp.columns \
+              else pd.Series(1, index=grp.index)
+
+        for col in _BLEND_COLS:
+            if col not in grp.columns:
+                continue
+            valid = grp[col].notna()
+            rec[f"p_{col}"] = (
+                np.average(grp.loc[valid, col], weights=pop[valid])
+                if valid.any() and pop[valid].sum() > 0
+                else grp[col].mean()
+            )
+        for col in _SUM_COLS:
+            if col in grp.columns:
+                rec[f"p_{col}"] = grp[col].fillna(0).sum()
+        if COL_DELTA_2035 in grp.columns:
+            rec[f"p_{COL_DELTA_2035}"] = grp[COL_DELTA_2035].iloc[0]
+
+        records.append(rec)
+    return pd.DataFrame(records)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Etap 5 — blending gmina / powiat
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _blend(df_gminy: pd.DataFrame, df_pow: pd.DataFrame) -> pd.DataFrame:
+    d    = df_gminy.merge(df_pow, on=COL_TERYT_POWIAT, how="left")
+    city = d["gmina_jest_powiatem"]
+
+    def blend(col: str) -> pd.Series:
+        gm = d[col].fillna(0)
+        pw = d[f"p_{col}"].fillna(0) if f"p_{col}" in d.columns else gm
+        return pd.Series(
+            np.where(city, gm, BLEND_GMINA * gm + BLEND_POWIAT * pw),
+            index=d.index
+        )
+
+    for col in _BLEND_COLS + _SUM_COLS:
+        if col in d.columns:
+            d[f"b_{col}"] = blend(col)
+
+    p_delta = f"p_{COL_DELTA_2035}"
+    if p_delta in d.columns:
+        d[f"b_{COL_DELTA_2035}"] = d[p_delta]
+
+    return d
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Etap 6 — składowe scoringu [0, 1]
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _compute_score_components(df: pd.DataFrame) -> pd.DataFrame:
+    d = df.copy()
+
+    b = lambda col: f"b_{col}"   # skrót
+
+    # 1. Penetracja gap
+    if b(COL_UDZIAL) in d.columns:
+        gap = (MAX_PENETRATION - d[b(COL_UDZIAL)]).clip(lower=0) / MAX_PENETRATION
+        d["c_penetracja_gap"] = _minmax(gap)
+    else:
+        d["c_penetracja_gap"] = np.nan
+
+    # 2. Luka konkurencyjna
+    if b(COL_OWN) in d.columns and b(COL_COMP) in d.columns:
+        total = d[b(COL_OWN)].fillna(0) + d[b(COL_COMP)].fillna(0)
+        share = np.where(total > 0, d[b(COL_OWN)].fillna(0) / total, 0.5)
+        d["c_share_oddzialow"]    = share
+        d["c_luka_konkurencyjna"] = _minmax(pd.Series(1 - share, index=d.index))
+    else:
+        d["c_luka_konkurencyjna"] = np.nan
+
+    # 3. Dynamika wzrostu
+    parts = []
+    if b(COL_MIGRACJA)  in d.columns: parts.append((d[b(COL_MIGRACJA)].fillna(0),  0.6))
+    if b(COL_PRZYROST)  in d.columns: parts.append((d[b(COL_PRZYROST)].fillna(0),  0.4))
+    if parts:
+        raw = sum(s * w for s, w in parts)
+        d["c_dynamika_wzrostu_raw"] = raw
+        d["c_dynamika_wzrostu"]     = _minmax(raw)
+    else:
+        d["c_dynamika_wzrostu"] = np.nan
+
+    # 4. Shift demograficzny
+    if b(COL_DELTA_2035) in d.columns:
+        d["c_shift_demograficzny"] = _minmax(d[b(COL_DELTA_2035)].fillna(0))
+    else:
+        d["c_shift_demograficzny"] = np.nan
+
+    return d
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Etap 7 — Composite Opportunity Score
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _compute_composite_score(df: pd.DataFrame, weights: dict) -> pd.DataFrame:
+    d = df.copy()
+    comp_map = {
+        "penetracja_gap":      "c_penetracja_gap",
+        "luka_konkurencyjna":  "c_luka_konkurencyjna",
+        "dynamika_wzrostu":    "c_dynamika_wzrostu",
+        "shift_demograficzny": "c_shift_demograficzny",
+    }
+    active  = {k: v for k, v in weights.items()
+               if comp_map.get(k) in d.columns and d[comp_map[k]].notna().any()}
+    norm_w  = {k: v / sum(active.values()) for k, v in active.items()}
+
+    score = sum(norm_w[k] * d[comp_map[k]].fillna(0) for k in norm_w)
+    d["opportunity_score"] = (score * 100).round(2)
+    d["segment"] = pd.cut(
+        d["opportunity_score"],
+        bins=[0, 30, 50, 70, 100],
+        labels=["Niski", "Średni", "Wysoki", "Priorytet"],
+        include_lowest=True,
+    )
+    d["rank"] = d["opportunity_score"].rank(ascending=False, method="min").astype(int)
+    return d
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Helpers pipeline
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _minmax(s: pd.Series) -> pd.Series:
+    mn, mx = s.min(), s.max()
+    return pd.Series(0.5, index=s.index) if mx == mn else (s - mn) / (mx - mn)
+
+
+def _find_col(df: pd.DataFrame, candidates: list) -> str:
+    for c in candidates:
+        if c in df.columns:
+            return c
+    raise KeyError(f"Nie znaleziono kolumny: {candidates}. Dostępne: {list(df.columns)}")
+
+
+def _validate_weights(w: dict) -> None:
+    total = sum(w.values())
+    if not np.isclose(total, 1.0, atol=0.01):
+        raise ValueError(f"Wagi muszą sumować się do 1.0, aktualnie: {total:.3f}")
+
+
+def _build_col_order(df: pd.DataFrame) -> list:
+    priority = [
+        "rank", "opportunity_score", "segment",
+        COL_TERYT_GMINA, COL_TERYT_POWIAT, COL_GMINA, COL_POWIAT,
+        "gmina_jest_powiatem", "n_placowek_wlasnych",
+        f"b_{COL_LUDNOSC}", f"b_{COL_UDZIAL}", f"b_{COL_MEDIANA}",
+        f"b_{COL_PRZYROST}", f"b_{COL_MIGRACJA}", f"b_{COL_DELTA_2035}",
+        f"b_{COL_OWN}", f"b_{COL_COMP}",
+        "c_penetracja_gap", "c_luka_konkurencyjna",
+        "c_dynamika_wzrostu_raw", "c_dynamika_wzrostu",
+        "c_share_oddzialow", "c_shift_demograficzny",
+    ]
+    existing  = [c for c in priority if c in df.columns]
+    remaining = [c for c in df.columns if c not in existing]
+    return existing + remaining
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# MODUŁ 2 — EKSPORT DO EXCELA
+# ══════════════════════════════════════════════════════════════════════════════
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Stałe stylistyczne
+# ─────────────────────────────────────────────────────────────────────────────
+
+_FONT     = "Arial"
+_NAVY     = "1F3864"
+_BLUE_MID = "2F5597"
+_BL_LIGHT = "BDD7EE"
+_WHITE    = "FFFFFF"
+_INPUT    = "0000FF"   # niebieski tekst = komórka edytowalna
+_BLACK    = "000000"
+_ALT      = "EEF2F7"
+_HEAD_BG  = "D6E4F0"
+_YELLOW   = "FFF2CC"   # tło żółte = komórka do edycji
+
+_SEG_STYLE = {
+    "Priorytet": ("1A6B3C", _WHITE),
+    "Wysoki":    ("2E86AB", _WHITE),
+    "Średni":    ("F4A261", _BLACK),
+    "Niski":     ("C9453A", _WHITE),
+}
+
+_THIN   = Side(style="thin",   color="B8C4D0")
+_MEDIUM = Side(style="medium", color="4472C4")
+_BRD    = Border(left=_THIN, right=_THIN, top=_THIN, bottom=_THIN)
+
+
+def _f(bold=False, size=10, color=_BLACK, name=_FONT):
+    return Font(bold=bold, size=size, color=color, name=name)
+
+def _fill(c):
+    return PatternFill("solid", fgColor=c)
+
+def _al(h="center", wrap=False):
+    return Alignment(horizontal=h, vertical="center", wrap_text=wrap)
+
+def _w(ws, row, col, val, bold=False, size=10, color=_BLACK,
+       bg=None, fmt=None, align="center", wrap=False, border=True):
+    cell = ws.cell(row=row, column=col, value=val)
+    cell.font      = _f(bold, size, color)
+    cell.alignment = _al(align, wrap)
+    if bg:    cell.fill   = _fill(bg)
+    if fmt:   cell.number_format = fmt
+    if border: cell.border = _BRD
+    return cell
+
+def _header(ws, row, labels, bg=_NAVY, height=32):
+    for col, lbl in enumerate(labels, 1):
+        c = ws.cell(row=row, column=col, value=lbl)
+        c.font      = _f(True, 10, _WHITE)
+        c.fill      = _fill(bg)
+        c.alignment = _al("center", wrap=True)
+        c.border    = _BRD
+    ws.row_dimensions[row].height = height
+
+def _title_merged(ws, row, c1, c2, text, bg=_NAVY, size=11):
+    ws.merge_cells(start_row=row, start_column=c1, end_row=row, end_column=c2)
+    cell = ws.cell(row=row, column=c1, value=text)
+    cell.font      = _f(True, size, _WHITE)
+    cell.fill      = _fill(bg)
+    cell.alignment = _al("center")
+    cell.border    = _BRD
+    ws.row_dimensions[row].height = 24
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Adresy komórek wag w arkuszu Dashboard (stałe — używane w formułach Rankingu)
+# ─────────────────────────────────────────────────────────────────────────────
+
+_WAGA_CELLS = {
+    "penetracja_gap":      "Dashboard!$B$5",
+    "luka_konkurencyjna":  "Dashboard!$B$6",
+    "dynamika_wzrostu":    "Dashboard!$B$7",
+    "shift_demograficzny": "Dashboard!$B$8",
+}
+_WAGA_SUM = "SUM(Dashboard!$B$5:Dashboard!$B$8)"
+
+# Mapowanie składowej → kolumna c_* w DataFrame (= kolumna w arkuszu Ranking)
+_COMP_COL_NAMES = {
+    "penetracja_gap":      "c_penetracja_gap",
+    "luka_konkurencyjna":  "c_luka_konkurencyjna",
+    "dynamika_wzrostu":    "c_dynamika_wzrostu",
+    "shift_demograficzny": "c_shift_demograficzny",
+}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Arkusz 1 — Dashboard
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _build_dashboard(wb: Workbook, df: pd.DataFrame, weights: dict):
+    ws = wb.active
+    ws.title = "Dashboard"
+    ws.sheet_view.showGridLines = False
+
+    # Tytuł
+    ws.merge_cells("A1:M1")
+    t = ws.cell(row=1, column=1, value="Bank · Opportunity Scoring · Dashboard")
+    t.font = _f(True, 14, _WHITE); t.fill = _fill(_NAVY); t.alignment = _al()
+    ws.row_dimensions[1].height = 36
+
+    # ── Blok wag ────────────────────────────────────────────────────────────
+    _title_merged(ws, 3, 1, 4, "Wagi scoringu (żółte komórki = edytowalne)", _BLUE_MID)
+    _header(ws, 4, ["Składowa", "Waga", "% sumy", "Opis"], bg=_HEAD_BG, height=28)
+    for r in range(4, 5):
+        for c in range(1, 5):
+            ws.cell(row=r, column=c).font = _f(True, 10, _BLACK)
+
+    weight_meta = [
+        ("penetracja_gap",      weights["penetracja_gap"],      "Niezagospodarowany potencjał rynkowy"),
+        ("luka_konkurencyjna",  weights["luka_konkurencyjna"],   "Udział własny vs. konkurencja"),
+        ("dynamika_wzrostu",    weights["dynamika_wzrostu"],     "Saldo migracji 60% + przyrost 40%"),
+        ("shift_demograficzny", weights["shift_demograficzny"],  "Zmiana grupy 20-35 wg powiatu (2035)"),
+    ]
+    for i, (key, waga, opis) in enumerate(weight_meta, start=5):
+        _w(ws, i, 1, key, align="left")
+        cell_w = ws.cell(row=i, column=2, value=waga)
+        cell_w.font = _f(True, 11, _INPUT); cell_w.fill = _fill(_YELLOW)
+        cell_w.alignment = _al(); cell_w.border = _BRD; cell_w.number_format = "0.00"
+        _w(ws, i, 3, f"=B{i}/SUM($B$5:$B$8)", fmt="0.0%")
+        _w(ws, i, 4, opis, align="left")
+
+    _w(ws, 9, 1, "Suma kontrolna wag", bold=True, bg=_HEAD_BG)
+    _w(ws, 9, 2, "=SUM(B5:B8)", bold=True, fmt="0.00")
+    _w(ws, 9, 3, "", border=True); _w(ws, 9, 4, "Musi wynosić 1.00", align="left",
+                                       color="7F7F7F", size=9)
+
+    # ── Parametry modelu ────────────────────────────────────────────────────
+    _title_merged(ws, 11, 1, 4, "Parametry modelu", _BLUE_MID)
+    _header(ws, 12, ["Parametr", "Wartość", "Opis", ""], bg=_HEAD_BG, height=24)
+    params = [
+        ("MAX_PENETRATION", MAX_PENETRATION, "Maks. zakładany udział klientów w populacji"),
+        ("BLEND_GMINA",     BLEND_GMINA,     "Waga danych gminnych (gmina ≠ powiat)"),
+        ("BLEND_POWIAT",    BLEND_POWIAT,    "Waga danych powiatowych (gmina ≠ powiat)"),
+    ]
+    for i, (name, val, desc) in enumerate(params, start=13):
+        _w(ws, i, 1, name, align="left")
+        cell_p = ws.cell(row=i, column=2, value=val)
+        cell_p.font = _f(True, 11, _INPUT); cell_p.fill = _fill(_YELLOW)
+        cell_p.alignment = _al(); cell_p.border = _BRD; cell_p.number_format = "0.00"
+        _w(ws, i, 3, desc, align="left"); _w(ws, i, 4, "")
+
+    # ── KPI ─────────────────────────────────────────────────────────────────
+    _title_merged(ws, 3, 6, 9, "Podsumowanie", _BLUE_MID)
+    kpi = [
+        ("Gmin w scoringu",        len(df),                          None),
+        ("Śr. Opportunity Score",  round(df["opportunity_score"].mean(), 1), None),
+        ("Segment Priorytet",      int((df["segment"]=="Priorytet").sum()), "1A6B3C"),
+        ("Segment Wysoki",         int((df["segment"]=="Wysoki").sum()),    "2E86AB"),
+        ("Segment Średni",         int((df["segment"]=="Średni").sum()),    "F4A261"),
+        ("Segment Niski",          int((df["segment"]=="Niski").sum()),     "C9453A"),
+    ]
+    for i, (lbl, val, color) in enumerate(kpi, start=4):
+        bg  = color or _HEAD_BG
+        tc  = _WHITE if color else _BLACK
+        _w(ws, i, 6, lbl,  align="left",   bg=bg, color=tc, bold=bool(color))
+        _w(ws, i, 7, val,  align="center", bg=bg, color=tc, bold=True, size=12)
+        ws.merge_cells(start_row=i, start_column=8, end_row=i, end_column=9)
+        _w(ws, i, 8, "", border=True)
+
+    # ── TOP 10 ──────────────────────────────────────────────────────────────
+    top10 = df.nlargest(10, "opportunity_score").reset_index(drop=True)
+    _title_merged(ws, 11, 6, 11, "TOP 10 gmin", _BLUE_MID)
+    _header(ws, 12, ["Rank","Gmina","Powiat","Score","Segment","Placówki"],
+            bg=_BLUE_MID, height=28)
+    for i, row in top10.iterrows():
+        r   = 13 + i
+        bg  = _ALT if i % 2 else _WHITE
+        seg = str(row.get("segment",""))
+        sbg, stc = _SEG_STYLE.get(seg, (bg, _BLACK))
+        _w(ws, r,  6, int(row["rank"]),                        bg=bg)
+        _w(ws, r,  7, str(row.get("gmina","")),                bg=bg, align="left")
+        _w(ws, r,  8, str(row.get("powiat","")),               bg=bg, align="left")
+        _w(ws, r,  9, row["opportunity_score"],                bg=bg, fmt="0.0")
+        _w(ws, r, 10, seg,                                     bg=sbg, color=stc, bold=True)
+        _w(ws, r, 11, int(row.get("n_placowek_wlasnych", 0)), bg=bg)
+
+    # ── Dane dla wykresu (kolumna N:O, ukryte) ──────────────────────────────
+    ws.cell(row=3, column=14, value="Gmina")
+    ws.cell(row=3, column=15, value="Score")
+    for i, row in top10.iterrows():
+        ws.cell(row=4+i, column=14, value=str(row.get("gmina","")))
+        ws.cell(row=4+i, column=15, value=row["opportunity_score"])
+
+    # Bar chart TOP 10
+    chart = BarChart()
+    chart.type = "bar"; chart.grouping = "clustered"
+    chart.title = "Opportunity Score – TOP 10"
+    chart.y_axis.title = "Gmina"; chart.x_axis.title = "Score (0–100)"
+    chart.style = 10; chart.width = 18; chart.height = 13
+    chart.x_axis.numFmt = "0"
+    chart.x_axis.scaling.min = 0; chart.x_axis.scaling.max = 100
+    dr = Reference(ws, min_col=15, min_row=3, max_row=13)
+    cr = Reference(ws, min_col=14, min_row=4, max_row=13)
+    chart.add_data(dr, titles_from_data=True)
+    chart.set_categories(cr)
+    chart.series[0].graphicalProperties.solidFill = "2F5597"
+    chart.series[0].dLbls = DataLabelList()
+    chart.series[0].dLbls.showVal = True
+    chart.series[0].dLbls.numFmt = "0.0"
+    ws.add_chart(chart, "F24")
+
+    ws.column_dimensions["A"].width = 24; ws.column_dimensions["B"].width = 10
+    ws.column_dimensions["C"].width = 10; ws.column_dimensions["D"].width = 40
+    ws.column_dimensions["E"].width = 2
+    for col in ["F","G","H","I","J","K"]:
+        ws.column_dimensions[col].width = 16
+    ws.column_dimensions["L"].width = 2
+    ws.column_dimensions["N"].width = 20; ws.column_dimensions["O"].width = 10
+    ws.column_dimensions["N"].hidden = True; ws.column_dimensions["O"].hidden = True
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Arkusz 2 — Ranking z dynamicznym score Excel
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _build_ranking(wb: Workbook, df: pd.DataFrame):
+    ws = wb.create_sheet("Ranking")
+    ws.sheet_view.showGridLines = False
+
+    # Kolumny statyczne (dane)
+    static_cols = [
+        (COL_GMINA,               "Gmina",            22, "@"),
+        (COL_POWIAT,              "Powiat",            18, "@"),
+        ("gmina_jest_powiatem",   "Miasto/powiat",      9, "@"),
+        ("n_placowek_wlasnych",   "Placówki",           8, "0"),
+        (f"b_{COL_LUDNOSC}",      "Ludność",           12, "#,##0"),
+        (f"b_{COL_UDZIAL}",       "Udział klientów",   12, "0.0%"),
+        (f"b_{COL_MEDIANA}",      "Mediana wyngr.",    12, "#,##0"),
+        (f"b_{COL_PRZYROST}",     "Przyrost nat.",     10, "0.0"),
+        (f"b_{COL_MIGRACJA}",     "Saldo migracji",    10, "0.0"),
+        (f"b_{COL_OWN}",          "Oddz. własne",       9, "0"),
+        (f"b_{COL_COMP}",         "Oddz. konk.",        9, "0"),
+        ("c_penetracja_gap",      "Penetracja gap",    12, "0.000"),
+        ("c_luka_konkurencyjna",  "Luka konk.",        12, "0.000"),
+        ("c_dynamika_wzrostu",    "Dynamika",          12, "0.000"),
+        ("c_shift_demograficzny", "Shift dem.",        12, "0.000"),
+    ]
+    available = [(c, l, w, f) for c, l, w, f in static_cols if c in df.columns]
+
+    # Dodajemy 3 kolumny dynamiczne na końcu
+    dyn_headers = ["Score (Excel)", "Segment (Excel)", "Rank (Excel)"]
+    all_headers = [l for _, l, _, _ in available] + dyn_headers
+
+    # Tytuł
+    total_cols = len(available) + 3
+    ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=total_cols)
+    t = ws.cell(row=1, column=1,
+                value="Ranking gmin — Score (Excel) przeliczany na bieżąco z wag w Dashboard")
+    t.font = _f(True, 12, _WHITE); t.fill = _fill(_NAVY); t.alignment = _al()
+    ws.row_dimensions[1].height = 32
+
+    # Nagłówki — dynamiczne kolumny w innym kolorze
+    base_fills = [_BLUE_MID] * len(available)
+    dyn_fills  = ["1A6B3C"] * 3
+    for col, (lbl, bg) in enumerate(zip(all_headers, base_fills + dyn_fills), 1):
+        c = ws.cell(row=2, column=col, value=lbl)
+        c.font = _f(True, 10, _WHITE); c.fill = _fill(bg)
+        c.alignment = _al("center", wrap=True); c.border = _BRD
+    ws.row_dimensions[2].height = 36
+
+    # Wyznacz indeksy kolumn składowych (potrzebne do formuły Score Excel)
+    comp_excel_cols = {}
+    for i, (col, *_) in enumerate(available, start=1):
+        for key, cname in _COMP_COL_NAMES.items():
+            if col == cname:
+                comp_excel_cols[key] = i
+
+    score_col_idx   = len(available) + 1
+    segment_col_idx = len(available) + 2
+    rank_col_idx    = len(available) + 3
+    score_letter    = get_column_letter(score_col_idx)
+
+    df_sorted = df.sort_values("opportunity_score", ascending=False).reset_index(drop=True)
+    n_rows    = len(df_sorted)
+
+    for i, (_, row) in enumerate(df_sorted.iterrows()):
+        r   = 3 + i
+        alt = i % 2 == 1
+        bg  = _ALT if alt else _WHITE
+
+        # Dane statyczne
+        for j, (col, _, _, fmt) in enumerate(available, start=1):
+            val = row.get(col, "")
+            if isinstance(val, (np.integer, np.int64)):   val = int(val)
+            if isinstance(val, (np.floating, np.float64)): val = float(val)
+            cell = ws.cell(row=r, column=j, value=val)
+            cell.fill = _fill(bg); cell.font = _f(size=10)
+            cell.alignment = _al(); cell.border = _BRD
+            cell.number_format = fmt
+
+        # ── Score (Excel) — formuła odwołująca się do wag w Dashboard ──────
+        # =( w1*c1 + w2*c2 + w3*c3 + w4*c4 ) / SUMA_WAG  * 100
+        parts = []
+        for key, cell_addr in _WAGA_CELLS.items():
+            ci = comp_excel_cols.get(key)
+            if ci:
+                parts.append(f"{cell_addr}*{get_column_letter(ci)}{r}")
+        if parts:
+            formula_score = f"=({'+'.join(parts)})/({_WAGA_SUM})*100"
+        else:
+            formula_score = row["opportunity_score"]
+
+        cell_s = ws.cell(row=r, column=score_col_idx, value=formula_score)
+        cell_s.fill = _fill(bg); cell_s.font = _f(True, 10)
+        cell_s.alignment = _al(); cell_s.border = _BRD
+        cell_s.number_format = "0.00"
+
+        # ── Segment (Excel) — formuła IFS na Score (Excel) ──────────────────
+        sc = f"{score_letter}{r}"
+        formula_seg = (
+            f'=IFS({sc}>70,"Priorytet",{sc}>50,"Wysoki",'
+            f'{sc}>30,"Średni",TRUE,"Niski")'
+        )
+        cell_sg = ws.cell(row=r, column=segment_col_idx, value=formula_seg)
+        cell_sg.fill = _fill(bg); cell_sg.font = _f(True, 10)
+        cell_sg.alignment = _al(); cell_sg.border = _BRD
+
+        # ── Rank (Excel) — RANK.EQ odwołujący się do całej kolumny Score ────
+        formula_rank = (
+            f"=RANK.EQ({sc},"
+            f"${score_letter}$3:${score_letter}${2+n_rows},0)"
+        )
+        cell_rk = ws.cell(row=r, column=rank_col_idx, value=formula_rank)
+        cell_rk.fill = _fill(bg); cell_rk.font = _f(True, 10)
+        cell_rk.alignment = _al(); cell_rk.border = _BRD
+        cell_rk.number_format = "0"
+
+    # Formatowanie warunkowe — color scale na Score (Excel)
+    last_r = 2 + n_rows
+    ws.conditional_formatting.add(
+        f"{score_letter}3:{score_letter}{last_r}",
+        ColorScaleRule(
+            start_type="min",      start_color="C9453A",
+            mid_type="percentile", mid_value=50, mid_color="F4A261",
+            end_type="max",        end_color="1A6B3C",
+        )
+    )
+
+    # Formatowanie warunkowe — kolor segmentu w kolumnie Segment (Excel)
+    seg_letter = get_column_letter(segment_col_idx)
+    for seg_val, (bg_c, fc) in _SEG_STYLE.items():
+        from openpyxl.formatting.rule import CellIsRule
+        ws.conditional_formatting.add(
+            f"{seg_letter}3:{seg_letter}{last_r}",
+            CellIsRule(
+                operator="equal",
+                formula=[f'"{seg_val}"'],
+                fill=_fill(bg_c),
+                font=_f(True, 10, fc),
+            )
+        )
+
+    for j, (_, _, width, _) in enumerate(available, 1):
+        ws.column_dimensions[get_column_letter(j)].width = width
+    ws.column_dimensions[get_column_letter(score_col_idx)].width   = 14
+    ws.column_dimensions[get_column_letter(segment_col_idx)].width = 14
+    ws.column_dimensions[get_column_letter(rank_col_idx)].width    = 10
+
+    ws.freeze_panes = "A3"
+    ws.auto_filter.ref = f"A2:{get_column_letter(total_cols)}2"
+
+
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Arkusz 3 — Składowe (audyt + scatter)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _build_skladowe(wb: Workbook, df: pd.DataFrame):
+    ws = wb.create_sheet("Składowe")
+    ws.sheet_view.showGridLines = False
+
+    comp_cols = [
+        (COL_GMINA,                  "Gmina",          22, "@"),
+        (COL_POWIAT,                 "Powiat",          16, "@"),
+        ("gmina_jest_powiatem",      "Miasto/pow.",      8, "@"),
+        ("c_penetracja_gap",         "Penetracja gap",  14, "0.000"),
+        ("c_luka_konkurencyjna",     "Luka konk.",      14, "0.000"),
+        ("c_dynamika_wzrostu_raw",   "Dynamika raw",    14, "0.0"),
+        ("c_dynamika_wzrostu",       "Dynamika [0-1]",  14, "0.000"),
+        ("c_shift_demograficzny",    "Shift dem.",      14, "0.000"),
+        ("c_share_oddzialow",        "Share oddz.",     12, "0.0%"),
+        ("opportunity_score",        "Score (Python)",  12, "0.00"),
+        ("segment",                  "Segment",         12, "@"),
+    ]
+    avail = [(c, l, w, f) for c, l, w, f in comp_cols if c in df.columns]
+
+    ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=len(avail))
+    t = ws.cell(row=1, column=1,
+                value="Składowe scoringu [0–1] — wartości wyliczone przez Pythona (audyt)")
+    t.font = _f(True, 12, _WHITE); t.fill = _fill(_NAVY); t.alignment = _al()
+    ws.row_dimensions[1].height = 28
+    _header(ws, 2, [l for _, l, _, _ in avail], bg=_BLUE_MID, height=32)
+
+    df_s = df.sort_values("opportunity_score", ascending=False).reset_index(drop=True)
+    for i, (_, row) in enumerate(df_s.iterrows()):
+        r = 3 + i; bg = _ALT if i % 2 else _WHITE
+        for j, (col, _, _, fmt) in enumerate(avail, 1):
+            val = row.get(col, "")
+            if isinstance(val, (np.integer,)):   val = int(val)
+            if isinstance(val, (np.floating,)):  val = float(val)
+            cell = ws.cell(row=r, column=j, value=val)
+            cell.fill = _fill(bg); cell.font = _f(size=10)
+            cell.alignment = _al(); cell.border = _BRD
+            cell.number_format = fmt
+
+    for j, (_, _, w, _) in enumerate(avail, 1):
+        ws.column_dimensions[get_column_letter(j)].width = w
+    ws.freeze_panes = "A3"
+
+    # Scatter: penetracja gap vs dynamika wzrostu
+    col_idx = {c: j for j, (c, *_) in enumerate(avail, 1)}
+    pg, dw  = col_idx.get("c_penetracja_gap"), col_idx.get("c_dynamika_wzrostu")
+    if pg and dw:
+        last_r = 2 + len(df_s)
+        chart2 = ScatterChart()
+        chart2.title   = "Penetracja gap vs Dynamika wzrostu"
+        chart2.style   = 10
+        chart2.x_axis.title = "Penetracja gap [0–1]"
+        chart2.y_axis.title = "Dynamika wzrostu [0–1]"
+        chart2.width   = 16; chart2.height = 12
+        xv = Reference(ws, min_col=pg, min_row=3, max_row=last_r)
+        yv = Reference(ws, min_col=dw, min_row=3, max_row=last_r)
+        s  = Series(yv, xv, title="Gminy")
+        s.marker.symbol = "circle"; s.marker.size = 5
+        s.graphicalProperties.line.noFill = True
+        s.marker.graphicalProperties.solidFill     = "2F5597"
+        s.marker.graphicalProperties.line.solidFill = "2F5597"
+        chart2.series.append(s)
+        ws.add_chart(chart2, f"{get_column_letter(len(avail)+2)}3")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Arkusz 4 — Dane po blendingu
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _build_dane(wb: Workbook, df: pd.DataFrame):
+    ws = wb.create_sheet("Dane")
+    ws.sheet_view.showGridLines = False
+
+    b_cols   = [c for c in df.columns if c.startswith("b_")]
+    id_cols  = [COL_TERYT_GMINA, COL_TERYT_POWIAT, COL_GMINA, COL_POWIAT,
+                "gmina_jest_powiatem", "n_placowek_wlasnych"]
+    all_cols = [c for c in id_cols if c in df.columns] + b_cols
+
+    ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=len(all_cols))
+    t = ws.cell(row=1, column=1,
+                value="Dane po blendingu (b_*) — źródło dla składowych scoringu")
+    t.font = _f(True, 12, _WHITE); t.fill = _fill(_NAVY); t.alignment = _al()
+    ws.row_dimensions[1].height = 28
+
+    labels = [c.replace("b_","").replace("_"," ") for c in all_cols]
+    _header(ws, 2, labels, bg=_BLUE_MID, height=32)
+
+    df_s = df.sort_values("opportunity_score", ascending=False).reset_index(drop=True)
+    for i, (_, row) in enumerate(df_s.iterrows()):
+        r = 3 + i; bg = _ALT if i % 2 else _WHITE
+        for j, col in enumerate(all_cols, 1):
+            val = row.get(col, "")
+            if isinstance(val, (np.integer,)):  val = int(val)
+            if isinstance(val, (np.floating,)): val = float(val)
+            cell = ws.cell(row=r, column=j, value=val)
+            cell.fill = _fill(bg); cell.font = _f(size=9)
+            cell.alignment = _al(); cell.border = _BRD
+    for j in range(1, len(all_cols)+1):
+        ws.column_dimensions[get_column_letter(j)].width = 18
+    ws.freeze_panes = "A3"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Główna funkcja eksportu
+# ─────────────────────────────────────────────────────────────────────────────
+
+def export_dashboard(
+    df: pd.DataFrame,
+    output_path: str = "scoring_dashboard.xlsx",
+    weights: dict | None = None,
+) -> str:
+    """
+    Generuje plik Excel z dashboardem i dynamicznym scoringiem.
+
+    Parameters
+    ----------
+    df           : DataFrame z run_scoring()
+    output_path  : ścieżka wyjściowa
+    weights      : wagi — jeśli None, używa DEFAULT_WEIGHTS
+
+    Returns
+    -------
+    str — ścieżka do zapisanego pliku
+    """
+    w = weights if weights is not None else DEFAULT_WEIGHTS.copy()
+
+    wb = Workbook()
+    print("[1/4] Dashboard...")
+    _build_dashboard(wb, df, w)
+    print("[2/4] Ranking z formułami Excel...")
+    _build_ranking(wb, df)
+    print("[3/4] Składowe...")
+    _build_skladowe(wb, df)
+    print("[4/4] Dane...")
+    _build_dane(wb, df)
+
+    wb.save(output_path)
+    print(f"\n[OK] {output_path}  |  arkusze: {wb.sheetnames}")
+    return output_path
