@@ -1,0 +1,116 @@
+WITH Wizyty AS (
+    -- 1️⃣ Budujemy wizyty (1 wiersz = 1 wizyta)
+    SELECT
+        Raban,
+        CAST(data AS date) AS data_wizyty,
+        klient,
+
+        MAX(CASE WHEN temat = 'Sprzedaż' THEN 1 ELSE 0 END) AS czy_sprzedaz,
+        MAX(CASE WHEN temat = 'Gotówką' THEN 1 ELSE 0 END) AS czy_gotowka
+    FROM tbl_traffic
+    GROUP BY
+        Raban,
+        CAST(data AS date),
+        klient
+),
+
+Wizyty_z_okresem AS (
+    -- 2️⃣ Przypisanie do okresów remontowych + numer miesiąca w okresie
+    SELECT
+        w.Raban,
+        w.data_wizyty,
+        w.klient,
+        w.czy_sprzedaz,
+        w.czy_gotowka,
+
+        CASE 
+            WHEN w.data_wizyty BETWEEN r.data_przed_od AND r.data_przed_do THEN 'PRZED'
+            WHEN w.data_wizyty BETWEEN r.data_po_od AND r.data_po_do THEN 'PO'
+        END AS okres,
+
+        CASE 
+            WHEN w.data_wizyty BETWEEN r.data_przed_od AND r.data_przed_do 
+                THEN DATEDIFF(MONTH, r.data_przed_od, w.data_wizyty) + 1
+            WHEN w.data_wizyty BETWEEN r.data_po_od AND r.data_po_do 
+                THEN DATEDIFF(MONTH, r.data_po_od, w.data_wizyty) + 1
+        END AS nr_miesiaca
+    FROM Wizyty w
+    JOIN Oddzialy_remonty r 
+        ON w.Raban = r.Raban
+    WHERE
+        w.data_wizyty BETWEEN r.data_przed_od AND r.data_przed_do
+        OR
+        w.data_wizyty BETWEEN r.data_po_od AND r.data_po_do
+),
+
+Zakresy AS (
+    -- 3️⃣ Tworzymy 3 zakresy czasowe
+    SELECT
+        Raban,
+        okres,
+        czy_sprzedaz,
+        czy_gotowka,
+        CASE 
+            WHEN nr_miesiaca IN (1,2,3) THEN '3_miesiace'
+            WHEN nr_miesiaca IN (2,3) THEN '2_miesiace'
+            WHEN nr_miesiaca = 3 THEN '1_miesiac'
+        END AS zakres
+    FROM Wizyty_z_okresem
+),
+
+Agregacja AS (
+    -- 4️⃣ Agregacja wizyt
+    SELECT
+        Raban,
+        okres,
+        zakres,
+        COUNT(*) AS wizyty,
+        SUM(czy_sprzedaz) AS wizyty_sprzedaz,
+        SUM(czy_gotowka) AS wizyty_gotowka
+    FROM Zakresy
+    GROUP BY Raban, okres, zakres
+),
+
+Pivotowane AS (
+    -- 5️⃣ Pivot BEFORE vs AFTER
+    SELECT
+        Raban,
+        zakres,
+
+        SUM(CASE WHEN okres = 'PRZED' THEN wizyty END) AS wizyty_przed,
+        SUM(CASE WHEN okres = 'PO' THEN wizyty END) AS wizyty_po,
+
+        SUM(CASE WHEN okres = 'PRZED' THEN wizyty_sprzedaz END) AS sprzedaz_przed,
+        SUM(CASE WHEN okres = 'PO' THEN wizyty_sprzedaz END) AS sprzedaz_po,
+
+        SUM(CASE WHEN okres = 'PRZED' THEN wizyty_gotowka END) AS gotowka_przed,
+        SUM(CASE WHEN okres = 'PO' THEN wizyty_gotowka END) AS gotowka_po
+
+    FROM Agregacja
+    GROUP BY Raban, zakres
+)
+
+-- 6️⃣ Finalny SELECT z dynamikami 📈
+SELECT
+    Raban,
+    zakres,
+
+    wizyty_przed,
+    wizyty_po,
+    CAST( (wizyty_po - wizyty_przed) * 1.0 / NULLIF(wizyty_przed,0) AS decimal(10,4)) AS dynamika_wizyt,
+
+    sprzedaz_przed,
+    sprzedaz_po,
+    CAST( (sprzedaz_po - sprzedaz_przed) * 1.0 / NULLIF(sprzedaz_przed,0) AS decimal(10,4)) AS dynamika_sprzedaz,
+
+    gotowka_przed,
+    gotowka_po,
+    CAST( (gotowka_po - gotowka_przed) * 1.0 / NULLIF(gotowka_przed,0) AS decimal(10,4)) AS dynamika_gotowka
+
+FROM Pivotowane
+ORDER BY Raban,
+         CASE zakres 
+            WHEN '3_miesiace' THEN 1
+            WHEN '2_miesiace' THEN 2
+            WHEN '1_miesiac' THEN 3
+         END;
