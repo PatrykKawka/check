@@ -1,153 +1,37 @@
-Aktywne filtry =
-VAR __separator = " | "
+// za pomocą miary możemy stworzyć animowane kropki, które zależnie od statusu będą świecić wybranym kolorem lub będą wybrane mrugać
 
-/* ---------- FUNKCJA POMOCNICZA (pattern) ---------- */
-/* Tworzy tekst: label + top3 + "+ X innych" */
-VAR __MakeText =
-    VAR __dummy = 0
-    RETURN __dummy
-/* (placeholder – DAX nie ma funkcji, więc pattern kopiujemy poniżej) */
+Status_Animated_SVG = 
+VAR Data_URL = "data:image/svg+xml;utf8,"
+VAR SVG_Start =
+    "<svg height='100' width='100' xmlns='http://www.w3.org/2000/svg'>"
 
+VAR Kolor_Statusu = [Status kolor] // może być tutaj funkcja a nie jako oddzialna ze SWITCH i SELECTEDVALUE
+VAR Status_ = [_Status] // lub funkcja z SELECTEDVALUE
+VAR Czas_Animacji = "3s"
 
-/* ---------- Proces ---------- */
-VAR _Proces =
-VAR _selected = VALUES(dim_P360[Proces])
-VAR _count = COUNTROWS(_selected)
-RETURN
-IF(
-    NOT ISFILTERED(dim_P360[Proces]),
-    BLANK(),
-    "Proces: "
-        & CONCATENATEX(
-            TOPN(3, _selected, dim_P360[Proces], ASC),
-            dim_P360[Proces],
-            ", "
-        )
-        & IF(_count > 3, " + " & (_count - 3) & " innych", "")
-)
+VAR Bez_Animacji =
+    "<circle r='30' cx='50' cy='50' fill='" & Kolor_Statusu & "'/>"
 
-/* ---------- Grupa procesów ---------- */
-VAR _Grupa =
-VAR _selected = VALUES(dim_P360[Grupa procesów])
-VAR _count = COUNTROWS(_selected)
-RETURN
-IF(
-    NOT ISFILTERED(dim_P360[Grupa procesów]),
-    BLANK(),
-    "Grupa procesów: "
-        & CONCATENATEX(
-            TOPN(3, _selected, dim_P360[Grupa procesów], ASC),
-            dim_P360[Grupa procesów],
-            ", "
-        )
-        & IF(_count > 3, " + " & (_count - 3) & " innych", "")
-)
+VAR Animacja =
+    "<style>
+        @keyframes blink {
+            0% {opacity:1;}
+            50% {opacity:0;}
+            100% {opacity:1;}
+        }
+        circle {animation: blink " & Czas_Animacji & " infinite;}
+     </style>
+     <circle r='30' cx='50' cy='50' fill='" & Kolor_Statusu & "'/>"
 
-/* ---------- Makroregion ---------- */
-VAR _Makroregion =
-VAR _selected = VALUES(dim_baza_kadrowa[Makroregion])
-VAR _count = COUNTROWS(_selected)
-RETURN
-IF(
-    NOT ISFILTERED(dim_baza_kadrowa[Makroregion]),
-    BLANK(),
-    "Makroregion: "
-        & CONCATENATEX(
-            TOPN(3, _selected, dim_baza_kadrowa[Makroregion], ASC),
-            dim_baza_kadrowa[Makroregion],
-            ", "
-        )
-        & IF(_count > 3, " + " & (_count - 3) & " innych", "")
-)
+VAR Check =
+    IF(Status_ = "Opóźnione", Animacja, Bez_Animacji)
 
-/* ---------- Obszar ---------- */
-VAR _Obszar =
-VAR _selected = VALUES(dim_baza_kadrowa[Obszar])
-VAR _count = COUNTROWS(_selected)
-RETURN
-IF(
-    NOT ISFILTERED(dim_baza_kadrowa[Obszar]),
-    BLANK(),
-    "Obszar: "
-        & CONCATENATEX(
-            TOPN(3, _selected, dim_baza_kadrowa[Obszar], ASC),
-            dim_baza_kadrowa[Obszar],
-            ", "
-        )
-        & IF(_count > 3, " + " & (_count - 3) & " innych", "")
-)
-
-/* ---------- Oddział ---------- */
-VAR _Oddzial =
-VAR _selected = VALUES(dim_baza_kadrowa[Nazwa oddziału])
-VAR _count = COUNTROWS(_selected)
-RETURN
-IF(
-    NOT ISFILTERED(dim_baza_kadrowa[Nazwa oddziału]),
-    BLANK(),
-    "Oddział: "
-        & CONCATENATEX(
-            TOPN(3, _selected, dim_baza_kadrowa[Nazwa oddziału], ASC),
-            dim_baza_kadrowa[Nazwa oddziału],
-            ", "
-        )
-        & IF(_count > 3, " + " & (_count - 3) & " innych", "")
-)
-
-/* ---------- Przypisanie ---------- */
-VAR _Przypisanie =
-VAR _selected = VALUES(dim_baza_kadrowa[Przypisanie])
-VAR _count = COUNTROWS(_selected)
-RETURN
-IF(
-    NOT ISFILTERED(dim_baza_kadrowa[Przypisanie]),
-    BLANK(),
-    "Przypisanie: "
-        & CONCATENATEX(
-            TOPN(3, _selected, dim_baza_kadrowa[Przypisanie], ASC),
-            dim_baza_kadrowa[Przypisanie],
-            ", "
-        )
-        & IF(_count > 3, " + " & (_count - 3) & " innych", "")
-)
-
-/* ---------- Pracownik ---------- */
-VAR _Pracownik =
-VAR _selected = VALUES(dim_baza_kadrowa[Numer osobowy])
-VAR _count = COUNTROWS(_selected)
-RETURN
-IF(
-    NOT ISFILTERED(dim_baza_kadrowa[Numer osobowy]),
-    BLANK(),
-    "Pracownik: "
-        & CONCATENATEX(
-            TOPN(3, _selected, dim_baza_kadrowa[Numer osobowy], ASC),
-            dim_baza_kadrowa[Numer osobowy],
-            ", "
-        )
-        & IF(_count > 3, " + " & (_count - 3) & " innych", "")
-)
-
-
-/* ---------- SKLEJANIE ---------- */
-VAR _result =
-    CONCATENATEX(
-        {
-            _Proces,
-            _Grupa,
-            _Makroregion,
-            _Obszar,
-            _Oddzial,
-            _Przypisanie,
-            _Pracownik
-        },
-        [Value],
-        __separator
-    )
+VAR SVG_End = "</svg>"
 
 RETURN
-IF(
-    _result = "",
-    "Aktualnie nie stosujesz żadnych filtrów",
-    "Aktywne filtry: " & _result
-)
+    Data_URL & SVG_Start & Check & SVG_End
+
+
+
+// zmieniamy format miary na image URL/Adres URL obrazu
+
